@@ -10,74 +10,90 @@ $IIRMB,A,x.x,a,,,IIII.II,a,yyyyy.yy,a,x.x,x.x,x.x,A,a*hh
  I_Distance of cross-track error in miles
 */
 // to verify
-const nmea = require('../nmea.js')
+/*
+ * RMB - Recommended Minimum Navigation Information
+ * Generates $--RMB with cross-track error, origin/destination, range, bearing and ETA.
+ *
+ * Enhancements in this PR:
+ * - Normalizes units (meters -> nautical miles).
+ * - Uses active waypoint position from navigation.courseGreatCircle.nextPoint.position
+ *   so waypoints set via NMEA2000/Signal K can be forwarded.
+ * - Configurable talker (GP/II) via NMEA_TALKER.
+ * - Adds detailed debug logging.
+ */
 
-function metersToNm(m) {
-  return m == null ? null : m / 1852
-}
+const {
+  toSentence,
+  talker,
+  radToDeg360,
+  toNmeaDegreesLatitude,
+  toNmeaDegreesLongitude
+} = require('../nmea')
 
-module.exports = function (app) {
-  return {
-    sentence: 'RMB',
-    title: 'RMB - Heading and distance to waypoint (Signal K)',
-    keys: [
-      'navigation.courseRhumbline.crossTrackError',
-      'navigation.courseRhumbline.nextPoint.position',
-      'navigation.courseRhumbline.nextPoint.distance',
-      'navigation.courseRhumbline.nextPoint.bearingTrue'
-    ],
-    f: function (xte_m, wpPos, wpDistance_raw, bearingTrue_rad) {
-      // DEBUG
-      console.log('[RMB DEBUG]', {
-        crossTrackError_m: xte_m,
-        waypointPos: wpPos,
-        wpDistance_raw,
-        bearingTrue_rad
-      })
+module.exports = function rmb (app, plugin, input) {
+  try {
+    const t = talker()
 
-      // Guardas de validez numérica
-      const hasWp =
-        wpPos &&
-        Number.isFinite(wpPos.latitude) &&
-        Number.isFinite(wpPos.longitude)
+    // Cross Track Error (meters). Positive means steer right of track.
+    const xte = plugin.getProp(input, 'navigation.courseGreatCircle.crossTrackError.value')
 
-      if (!hasWp) {
-        console.warn('[RMB DEBUG] Waypoint inválido o ausente (lat/lon no finitos). No emito RMB.')
-        return
-      }
+    // Origin waypoint ID (optional in Signal K)
+    const originId = plugin.getProp(input, 'navigation.courseGreatCircle.origin.name') ||
+                     plugin.getProp(input, 'navigation.courseGreatCircle.origin.identifier') || ''
 
-      if (!Number.isFinite(wpDistance_raw)) {
-        console.warn('[RMB DEBUG] Distancia a WP no finita. No emito RMB.')
-        return
-      }
+    // Destination / next point info
+    const destId = plugin.getProp(input, 'navigation.courseGreatCircle.nextPoint.name') ||
+                   plugin.getProp(input, 'navigation.courseGreatCircle.nextPoint.identifier') ||
+                   'WAYPOINT'
 
-      if (!Number.isFinite(bearingTrue_rad)) {
-        console.warn('[RMB DEBUG] Rumbo verdadero a WP no finito. No emito RMB.')
-        return
-      }
+    const destPos = plugin.getProp(input, 'navigation.courseGreatCircle.nextPoint.position.value')
+    const rangeNm = plugin.getProp(input, 'navigation.courseGreatCircle.nextPoint.distance.value') // meters
+    const brgTrue = plugin.getProp(input, 'navigation.courseGreatCircle.nextPoint.bearingTrue.value')
 
-      // XTE puede venir null; si no es finito lo tratamos como 0 para el formato
-      const xteNmRaw = Number.isFinite(xte_m) ? metersToNm(xte_m) : 0
-      const xteNm = (xteNmRaw || 0)
-      const dir = (xteNm < 0) ? 'R' : 'L'
-
-      const distNm = (wpDistance_raw > 1000
-        ? metersToNm(wpDistance_raw)
-        : wpDistance_raw || 0)
-
-      const bearingTrueDeg = nmea.radsToDeg(bearingTrue_rad || 0)
-
-      return nmea.toSentence([
-        '$IIRMB',
-        Math.abs(xteNm).toFixed(2),
-        dir,
-        nmea.toNmeaDegreesLatitude(wpPos.latitude),
-        nmea.toNmeaDegreesLongitude(wpPos.longitude),
-        (distNm || 0).toFixed(2),
-        (bearingTrueDeg || 0).toFixed(2),
-        'V', // Arrival circle status (lo dejamos como venía)
-        ''
-      ])
+    if (xte == null || !destPos || brgTrue == null) {
+      plugin.debug('[RMB] Missing fields: need xte, nextPoint.position and nextPoint.bearingTrue')
+      return null
     }
+
+    const xteNm = Math.abs(xte) / 1852
+    const lOrR = xte >= 0 ? 'R' : 'L'
+
+    const destLatStr = toNmeaDegreesLatitude(destPos.latitude)
+    const destLonStr = toNmeaDegreesLongitude(destPos.longitude)
+
+    // Convert meters to NM if provided, else leave empty per sentence spec
+    const rangeNmVal = (typeof rangeNm === 'number') ? (rangeNm / 1852) : ''
+    const brgTrueDeg = radToDeg360(brgTrue)
+
+    // Velocity towards destination in knots if available
+    const vmg = plugin.getProp(input, 'navigation.courseGreatCircle.vmgTowardsDestination.value') // m/s
+    const arrivalTime = plugin.getProp(input, 'navigation.courseGreatCircle.estimatedTimeOfArrival.value') // ISO timestamp
+
+    // RMB does not have a native time field, but includes 'arrival status' and 'time to go' in some vendor variants.
+    // We'll keep standard RMB fields and leave vendor specifics blank.
+    const arrivalStatus = 'A' // 'A' = data valid
+
+    const sentenceParts = [
+      `${t}RMB`,
+      'A',                          // Status: Active/Valid
+      xteNm.toFixed(3),             // Cross track error magnitude (NM)
+      lOrR,                         // Direction to steer (L/R)
+      originId,                     // Origin waypoint ID
+      destId,                       // Destination waypoint ID
+      destLatStr.split(',')[0],     // Dest latitude ddmm.mmmm
+      destLatStr.split(',')[1],     // N/S
+      destLonStr.split(',')[0],     // Dest longitude dddmm.mmmm
+      destLonStr.split(',')[1],     // E/W
+      rangeNmVal === '' ? '' : Number(rangeNmVal).toFixed(2), // Range to dest (NM)
+      brgTrueDeg.toFixed(1),        // Bearing to dest (True, degrees)
+      vmg != null ? (vmg * 1.94384).toFixed(2) : '', // Velocity towards dest (kn), if available
+      arrivalStatus                 // Arrival circle entered (A/V) - use 'A' when valid
+    ]
+
+    const sentence = toSentence(sentenceParts)
+    return [sentence]
+  } catch (e) {
+    plugin.debug('[RMB] Error building sentence:', e.message)
+    return null
   }
 }
