@@ -1,133 +1,113 @@
-const m_hex = [
-  '0','1','2','3','4','5','6','7','8','9',
-  'A','B','C','D','E','F'
-]
+/*
+ * Utility helpers to build NMEA 0183 sentences and convert coordinates.
+ * All comments are in English to comply with repository guidelines.
+ */
 
-function toSentence (parts) {
-  var base = parts.join(',')
-  return base + computeChecksum(base)
+const m_hex = ['0','1','2','3','4','5','6','7','8','9','A','B','C','D','E','F']
+
+function toSentence(parts) {
+  // Joins the parts with commas, adds leading '$' if not present,
+  // and appends checksum after '*'.
+  // Example: ['GPRMB','A','...'] -> '$GPRMB,A,...*CS'
+  const body = parts.join(',')
+  const prefixed = body.startsWith('$') ? body : ('$' + body)
+  const checksumVal = checksum(prefixed.slice(1, prefixed.indexOf('*') > -1 ? prefixed.indexOf('*') : undefined))
+  const starIdx = prefixed.indexOf('*')
+  const head = starIdx === -1 ? prefixed : prefixed.slice(0, starIdx)
+  return head + '*' + checksumVal
 }
 
-function computeChecksum (sentence) {
-  // skip the $
-  let i = 1
-  // init to first character
-  let c1 = sentence.charCodeAt(i)
-  // process rest of characters, zero delimited
-  for (i = 2; i < sentence.length; ++i) {
-    c1 = c1 ^ sentence.charCodeAt(i)
+function checksum(sentenceWithoutDollar) {
+  // XOR of all chars until '*' (excluded). Input must NOT start with '$'.
+  let cs = 0
+  for (let i = 0; i < sentenceWithoutDollar.length; i++) {
+    const ch = sentenceWithoutDollar[i]
+    if (ch === '*') break
+    cs = cs ^ sentenceWithoutDollar.charCodeAt(i)
   }
-  return '*' + toHexString(c1)
+  // Convert to two uppercase hex digits
+  return m_hex[(cs >> 4) & 0x0f] + m_hex[cs & 0x0f]
 }
 
-function toHexString (v) {
-  let msn = (v >> 4) & 0x0f
-  let lsn = (v >> 0) & 0x0f
-  return m_hex[msn] + m_hex[lsn]
-}
-
-function radsToDeg (radians) {
-  return radians * 180 / Math.PI
-}
-
-function msToKnots (v) {
-  return v * 3600 / 1852.0
-}
-
-function msToKM (v) {
-  return v * 3600.0 / 1000.0
-}
-
-function mToNm (v) {
-  return v * 0.000539957
-}
-
-function padd (n, p, c) {
-  let pad_char = typeof c !== 'undefined' ? c : '0'
-  let pad = new Array(1 + p).join(pad_char)
+function padd(n, p, c) {
+  // Left-pad number n to the same length as p using char c (defaults to '0')
+  const pad = (c ? '' + c : '0').repeat(('' + p).length)
   return (pad + n).slice(-pad.length)
 }
 
-function decimalDegreesToDegreesAndDecimalMinutes (degrees) {
-  /*
-    Toma grados decimales y devuelve [deg, min, dir]
-    donde dir = +1 (N/E), -1 (S/W).
-  */
-  let dir = 1
+/**
+ * Converts decimal degrees to [degrees, minutes, dirSign].
+ * @param {number} degrees decimal degrees
+ * @returns {[number, number, 1|-1]} [deg, minutes, dir]; dir=+1 for N/E, -1 for S/W.
+ * NOTE: 0 degrees is considered N or E.
+ */
+function decimalDegreesToDegreesAndDecimalMinutes(degrees) {
+  let dir = 1 // default to N or E
   if (degrees < 0) {
     dir = -1
     degrees *= -1
   }
-  let degrees_out = Math.floor(degrees)
-  let minutes = (degrees % 1) * 60
+  const degrees_out = Math.floor(degrees)
+  const minutes = (degrees % 1) * 60
   return [degrees_out, minutes, dir]
 }
 
-function toNmeaDegreesLatitude (inVal) {
-  /*
-    Devuelve "DDMM.MMMM,N|S".
-    Lanza si el valor no es finito o está fuera de [-90, 90].
-  */
+/**
+ * Converts latitude in decimal degrees to NMEA ddmm.mmmm,N|S
+ * Throws if input is not finite or outside [-90, 90].
+ */
+function toNmeaDegreesLatitude(inVal) {
   if (!Number.isFinite(inVal) || inVal < -90 || inVal > 90) {
-    throw new Error("invalid input to toNmeaDegreesLatitude: " + inVal)
+    throw new Error('invalid input to toNmeaDegreesLatitude: ' + inVal)
   }
-  let [degrees, minutes, dir] = decimalDegreesToDegreesAndDecimalMinutes(inVal)
+  const [degrees, minutes, dir] = decimalDegreesToDegreesAndDecimalMinutes(inVal)
   return (
     padd(degrees.toFixed(0), 2) +
     padd(minutes.toFixed(4), 7) +
-    "," + (dir > 0 ? "N" : "S")
+    ',' + (dir > 0 ? 'N' : 'S')
   )
 }
 
-function toNmeaDegreesLongitude (inVal) {
-  /*
-    Devuelve "DDDMM.MMMM,E|W".
-    Lanza si el valor no es finito o está fuera de [-180, 180).
-  */
+/**
+ * Converts longitude in decimal degrees to NMEA dddmm.mmmm,E|W
+ * Throws if input is not finite or outside [-180, 180).
+ */
+function toNmeaDegreesLongitude(inVal) {
   if (!Number.isFinite(inVal) || inVal < -180 || inVal >= 180) {
-    throw new Error("invalid input to toNmeaDegreesLongitude: " + inVal)
+    throw new Error('invalid input to toNmeaDegreesLongitude: ' + inVal)
   }
-  let [degrees, minutes, dir] = decimalDegreesToDegreesAndDecimalMinutes(inVal)
+  const [degrees, minutes, dir] = decimalDegreesToDegreesAndDecimalMinutes(inVal)
   return (
     padd(degrees.toFixed(0), 3) +
     padd(minutes.toFixed(4), 7) +
-    "," + (dir > 0 ? "E" : "W")
+    ',' + (dir > 0 ? 'E' : 'W')
   )
 }
 
-// Helpers opcionales que no lanzan, devuelven null en caso de error
-function toNmeaDegreesLatitudeOrNull(v) {
-  try { return toNmeaDegreesLatitude(v) } catch { return null }
-}
-function toNmeaDegreesLongitudeOrNull(v) {
-  try { return toNmeaDegreesLongitude(v) } catch { return null }
-}
-
-function fixAngle (d) {
-  let result = d
-  if (d > Math.PI) result -= 2 * Math.PI
-  if (d < -Math.PI) result += 2 * Math.PI
-  return result
+/**
+ * Converts radians to degrees in [0,360).
+ */
+function radToDeg360(rad) {
+  let deg = (rad * 180) / Math.PI
+  while (deg < 0) deg += 360
+  while (deg >= 360) deg -= 360
+  return deg
 }
 
-function toPositiveRadians (d) {
-  return d < 0 ? d + 2 * Math.PI : d
-}
-
-function radsToPositiveDeg(r) {
-  return radsToDeg(toPositiveRadians(r))
+/**
+ * Returns the talker ID to use for sentences.
+ * Defaults to 'GP' (widest compatibility). Can be overridden with env NMEA_TALKER=II.
+ */
+function talker() {
+  const t = (process.env.NMEA_TALKER || 'GP').toUpperCase()
+  return t === 'II' ? 'II' : 'GP'
 }
 
 module.exports = {
   toSentence,
-  radsToDeg,
-  msToKnots,
-  msToKM,
+  checksum,
   toNmeaDegreesLatitude,
   toNmeaDegreesLongitude,
-  toNmeaDegreesLatitudeOrNull,
-  toNmeaDegreesLongitudeOrNull,
-  fixAngle,
-  radsToPositiveDeg,
-  mToNm
+  radToDeg360,
+  talker
 }
