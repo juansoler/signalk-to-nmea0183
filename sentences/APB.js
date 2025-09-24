@@ -1,90 +1,92 @@
 /*
  * APB - Autopilot Sentence "APB"
- * Generates $--APB using current cross-track error, bearings and waypoint information.
+ * Generates $--APB using cross-track error, bearings and (optionally) magnetic variation.
  *
- * Enhancements in this PR:
- * - Uses the real waypoint identifier/name instead of a fixed placeholder.
- * - Computes magnetic bearing from navigation.magneticVariation if needed.
- * - Configurable talker ID (GP/II) via NMEA_TALKER env var.
- * - Adds debug logging to help troubleshoot field selection.
+ * Notes:
+ * - Uses Signal K courseGreatCircle keys for consistency with RMB/WPL/RTE.
+ * - If magnetic bearing is not provided, it is computed from bearingTrue + magneticVariation.
+ * - Talker can be overridden with env NMEA_TALKER (defaults to 'GP').
+ *
+ * NMEA 0183 APB reference (common variant used by this plugin):
+ * $--APB,A,A,x.x,a,N,V,V,xxx,T,00,xxx,T,xxx,M*hh
+ *   1  2  3   4   5 6 7   8   9 10 11 12 13 14
+ * 1-2: Status flags (A/A)
+ * 3-5: Cross Track Error magnitude (NM), steer direction (L/R), units (N)
+ * 6-7: Arrival/perpendicular passed (often V/V for generic use)
+ * 8-9: Bearing origin→destination (degrees, True)
+ * 10 : (Placeholder / not used in this variant)
+ * 11-12: Bearing present position→destination (degrees, True)
+ * 13-14: Bearing present position→destination (degrees, Magnetic)
  */
 
-const {
-  toSentence,
-  radToDeg360,
-  talker
-} = require('../nmea')
+const nmea = require('../nmea.js')
 
-module.exports = function apb (app, plugin, input) {
-  // input: Signal K "delta" object
-  // Returns array with one NMEA sentence string or null if not enough data.
+module.exports = function (app) {
+  return {
+    sentence: 'APB',
+    title: 'APB - Autopilot info',
+    keys: [
+      // Cross-track error in meters (+ means right of track)
+      'navigation.courseGreatCircle.crossTrackError',
+      // Track/bearing (True) along the great circle
+      'navigation.courseGreatCircle.bearingTrackTrue',
+      // Bearing from present position to next waypoint (True)
+      'navigation.courseGreatCircle.nextPoint.bearingTrue',
+      // Bearing from present position to next waypoint (Magnetic), if provided
+      'navigation.courseGreatCircle.nextPoint.bearingMagnetic',
+      // Magnetic variation (radians, +E). Used if magnetic bearing is not provided.
+      'navigation.magneticVariation'
+    ],
+    f: function (xte_m, trackTrue_rad, nextTrue_rad, nextMag_rad, var_rad) {
+      // Choose talker: default 'GP', allow override via env
+      const talker = (process.env.NMEA_TALKER || 'GP').toUpperCase()
 
-  try {
-    const t = talker()
+      // Basic numeric validation
+      const hasXte = Number.isFinite(xte_m)
+      const trueBearing = Number.isFinite(nextTrue_rad)
+        ? nextTrue_rad
+        : trackTrue_rad
 
-    // Pull required values from Signal K, preferring courseGreatCircle (CGC)
-    // as it is consistent with RMB/RTE/WPL route data.
-    const xte = plugin.getProp(input, 'navigation.courseGreatCircle.crossTrackError.value') // meters, + right of track
-    const brgTrue = plugin.getProp(input, 'navigation.courseGreatCircle.bearingTrackTrue.value') ??
-                    plugin.getProp(input, 'navigation.courseRhumbline.bearingTrackTrue.value')
+      if (!hasXte || !Number.isFinite(trueBearing)) {
+        // Not enough data to emit APB
+        return
+      }
 
-    // Use next point info when available (often set by Course API / active route)
-    const nextTrue = plugin.getProp(input, 'navigation.courseGreatCircle.nextPoint.bearingTrue.value') ??
-                     plugin.getProp(input, 'navigation.courseRhumbline.nextPoint.bearingTrue.value')
+      // Cross track error: meters -> nautical miles (absolute magnitude for field #3)
+      const xteNm = Math.abs(nmea.mToNm(xte_m)).toFixed(3)
 
-    // Magnetic variation or bearingMagnetic if provided
-    const varMag = plugin.getProp(input, 'navigation.magneticVariation.value') // radians (+E)
-    const brgMag = plugin.getProp(input, 'navigation.courseGreatCircle.bearingTrackMagnetic.value') ??
-                   (brgTrue != null && varMag != null ? (brgTrue + varMag) : null)
+      // Direction to steer: R if XTE is to the right of track, else L
+      // (Signal K crossTrackError > 0 typically means right of track)
+      const steerDir = xte_m >= 0 ? 'R' : 'L'
 
-    // Waypoint identifier (prefer name/id on nextPoint)
-    const wpId = plugin.getProp(input, 'navigation.courseGreatCircle.nextPoint.name') ||
-                 plugin.getProp(input, 'navigation.courseGreatCircle.nextPoint.identifier') ||
-                 'WAYPOINT'
+      // Compute magnetic bearing if not explicitly provided:
+      // bearingMagnetic = bearingTrue + magneticVariation
+      let bearingMag_rad = Number.isFinite(nextMag_rad)
+        ? nextMag_rad
+        : (Number.isFinite(var_rad) ? trueBearing + var_rad : undefined)
 
-    if (xte == null || (brgTrue == null && nextTrue == null)) {
-      plugin.debug('[APB] Missing fields: xte or bearings not available')
-      return null
+      // Build sentence fields
+      const parts = [
+        `$${talker}APB`,
+        'A',                               // 1: status
+        'A',                               // 2: status
+        xteNm,                             // 3: XTE magnitude (NM)
+        steerDir,                          // 4: steer L/R
+        'N',                               // 5: units = Nautical miles
+        'V',                               // 6: arrival circle entered (V in this variant)
+        'V',                               // 7: perpendicular passed (V in this variant)
+        nmea.radsToPositiveDeg(trueBearing).toFixed(0), // 8: origin→dest bearing (deg)
+        'T',                               // 9: True
+        '00',                              // 10: placeholder / not used here
+        nmea.radsToPositiveDeg(trueBearing).toFixed(0), // 11: bearing P→D (deg True)
+        'T',                               // 12: True
+        Number.isFinite(bearingMag_rad)
+          ? nmea.radsToPositiveDeg(bearingMag_rad).toFixed(0)
+          : '',                            // 13: bearing P→D (deg Magnetic) if known
+        'M'                                // 14: Magnetic
+      ]
+
+      return nmea.toSentence(parts)
     }
-
-    // APB fields (NMEA 0183 v2.3):
-    // A, A, XTE, L/R, cross track magnitude (NM), units=N, bearing origin to dest (deg True),
-    // bearing origin to dest (deg Mag), heading to steer (deg True), heading to steer (deg Mag),
-    // dest waypoint ID, mode (A=Autopilot), FAA mode (A=Autonomous)
-    const xteNm = Math.abs(xte) / 1852 // meters -> nautical miles
-    const lOrR = xte >= 0 ? 'R' : 'L'
-
-    const bearingTrueDeg = radToDeg360(nextTrue != null ? nextTrue : brgTrue)
-    const bearingMagDeg = brgMag != null ? radToDeg360(brgMag) : ''
-
-    // Some pilots expect heading-to-steer to match true/mag bearings
-    const htsTrueDeg = bearingTrueDeg
-    const htsMagDeg = bearingMagDeg
-
-    const sentenceParts = [
-      `${t}APB`,
-      'A', // Status: Loran-C Blink/SNR warning (A=OK)
-      'A', // Status: Loran-C Cycle Lock warning (A=OK)
-      xteNm.toFixed(3),
-      lOrR,
-      'N',
-      bearingTrueDeg.toFixed(1),
-      'T',
-      bearingMagDeg === '' ? '' : bearingMagDeg.toFixed(1),
-      'M',
-      htsTrueDeg.toFixed(1),
-      'T',
-      htsMagDeg === '' ? '' : htsMagDeg.toFixed(1),
-      'M',
-      wpId,
-      'A', // mode indicator
-      'A'  // FAA mode (A = Autonomous)
-    ]
-
-    const sentence = toSentence(sentenceParts)
-    return [sentence]
-  } catch (e) {
-    plugin.debug('[APB] Error building sentence:', e.message)
-    return null
   }
 }
