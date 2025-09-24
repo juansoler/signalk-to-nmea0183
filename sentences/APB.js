@@ -1,78 +1,90 @@
-const nmea = require('../nmea.js')
+/*
+ * APB - Autopilot Sentence "APB"
+ * Generates $--APB using current cross-track error, bearings and waypoint information.
+ *
+ * Enhancements in this PR:
+ * - Uses the real waypoint identifier/name instead of a fixed placeholder.
+ * - Computes magnetic bearing from navigation.magneticVariation if needed.
+ * - Configurable talker ID (GP/II) via NMEA_TALKER env var.
+ * - Adds debug logging to help troubleshoot field selection.
+ */
 
-module.exports = function (app) {
-  return {
-    sentence: 'APB',
-    title: 'APB - Autopilot info (Signal K)',
-    keys: [
-      'navigation.courseGreatCircle.crossTrackError',
-      'navigation.courseGreatCircle.bearingTrackTrue',
-      'navigation.courseGreatCircle.nextPoint.bearingTrue',
-      'navigation.magneticVariation',
-      // Candado: solo emitimos APB si hay WP activo con lat/lon válidos
-      'navigation.courseRhumbline.nextPoint.position'
-    ],
-    f: function (xte_m, trackTrue_rad, bearingTrue_rad, var_rad, wpPos) {
-      // DEBUG
-      console.log('[APB DEBUG]', {
-        crossTrackError_m: xte_m,
-        bearingTrackTrue_rad: trackTrue_rad,
-        bearingTrue_rad: bearingTrue_rad,
-        magneticVariation_rad: var_rad,
-        wpPos
-      })
+const {
+  toSentence,
+  radToDeg360,
+  talker
+} = require('../nmea')
 
-      // Requisitos numéricos
-      const numOk =
-        Number.isFinite(xte_m) &&
-        Number.isFinite(trackTrue_rad) &&
-        Number.isFinite(bearingTrue_rad)
+module.exports = function apb (app, plugin, input) {
+  // input: Signal K "delta" object
+  // Returns array with one NMEA sentence string or null if not enough data.
 
-      if (!numOk) {
-        console.warn('[APB DEBUG] Faltan claves numéricas finitas (XTE/Track/Bearing). No emito APB.')
-        return
-      }
+  try {
+    const t = talker()
 
-      // Candado: WP activo (lat/lon finitos)
-      const hasWp =
-        wpPos &&
-        Number.isFinite(wpPos.latitude) &&
-        Number.isFinite(wpPos.longitude)
+    // Pull required values from Signal K, preferring courseGreatCircle (CGC)
+    // as it is consistent with RMB/RTE/WPL route data.
+    const xte = plugin.getProp(input, 'navigation.courseGreatCircle.crossTrackError.value') // meters, + right of track
+    const brgTrue = plugin.getProp(input, 'navigation.courseGreatCircle.bearingTrackTrue.value') ??
+                    plugin.getProp(input, 'navigation.courseRhumbline.bearingTrackTrue.value')
 
-      if (!hasWp) {
-        console.warn('[APB DEBUG] No hay waypoint activo (lat/lon no finitos). No emito APB.')
-        return
-      }
+    // Use next point info when available (often set by Course API / active route)
+    const nextTrue = plugin.getProp(input, 'navigation.courseGreatCircle.nextPoint.bearingTrue.value') ??
+                     plugin.getProp(input, 'navigation.courseRhumbline.nextPoint.bearingTrue.value')
 
-      const xteNm = Math.abs(nmea.mToNm(xte_m || 0)).toFixed(3)
-      const dir = (xte_m > 0 ? 'L' : 'R')
+    // Magnetic variation or bearingMagnetic if provided
+    const varMag = plugin.getProp(input, 'navigation.magneticVariation.value') // radians (+E)
+    const brgMag = plugin.getProp(input, 'navigation.courseGreatCircle.bearingTrackMagnetic.value') ??
+                   (brgTrue != null && varMag != null ? (brgTrue + varMag) : null)
 
-      const originToDest_T = nmea.radsToPositiveDeg(trackTrue_rad || 0)
-      const bearingTrue_T  = nmea.radsToPositiveDeg(bearingTrue_rad || 0)
+    // Waypoint identifier (prefer name/id on nextPoint)
+    const wpId = plugin.getProp(input, 'navigation.courseGreatCircle.nextPoint.name') ||
+                 plugin.getProp(input, 'navigation.courseGreatCircle.nextPoint.identifier') ||
+                 'WAYPOINT'
 
-      let bearingMag_M = bearingTrue_T
-      if (Number.isFinite(var_rad)) {
-        const varDeg = nmea.radsToDeg(var_rad)
-        bearingMag_M = ((bearingTrue_T - varDeg) % 360 + 360) % 360
-      }
-
-      return nmea.toSentence([
-        '$IIAPB',
-        'A',                      // Status 1
-        'A',                      // Status 2
-        xteNm,                    // Cross Track Error Magnitude (NM, abs)
-        dir,                      // Direction to steer
-        'N',                      // Units = Nautical Miles
-        'V',                      // Arrival circle status (como tenías)
-        'V',                      // Perpendicular passed (como tenías)
-        originToDest_T.toFixed(0),
-        'T',
-        '00',                     // Bearing origin to dest (magnético opcional; lo dejamos '00' como en tu ejemplo)
-        bearingTrue_T.toFixed(0),
-        'T',
-        bearingMag_M.toFixed(0),
-        'M'
-      ])
+    if (xte == null || (brgTrue == null && nextTrue == null)) {
+      plugin.debug('[APB] Missing fields: xte or bearings not available')
+      return null
     }
+
+    // APB fields (NMEA 0183 v2.3):
+    // A, A, XTE, L/R, cross track magnitude (NM), units=N, bearing origin to dest (deg True),
+    // bearing origin to dest (deg Mag), heading to steer (deg True), heading to steer (deg Mag),
+    // dest waypoint ID, mode (A=Autopilot), FAA mode (A=Autonomous)
+    const xteNm = Math.abs(xte) / 1852 // meters -> nautical miles
+    const lOrR = xte >= 0 ? 'R' : 'L'
+
+    const bearingTrueDeg = radToDeg360(nextTrue != null ? nextTrue : brgTrue)
+    const bearingMagDeg = brgMag != null ? radToDeg360(brgMag) : ''
+
+    // Some pilots expect heading-to-steer to match true/mag bearings
+    const htsTrueDeg = bearingTrueDeg
+    const htsMagDeg = bearingMagDeg
+
+    const sentenceParts = [
+      `${t}APB`,
+      'A', // Status: Loran-C Blink/SNR warning (A=OK)
+      'A', // Status: Loran-C Cycle Lock warning (A=OK)
+      xteNm.toFixed(3),
+      lOrR,
+      'N',
+      bearingTrueDeg.toFixed(1),
+      'T',
+      bearingMagDeg === '' ? '' : bearingMagDeg.toFixed(1),
+      'M',
+      htsTrueDeg.toFixed(1),
+      'T',
+      htsMagDeg === '' ? '' : htsMagDeg.toFixed(1),
+      'M',
+      wpId,
+      'A', // mode indicator
+      'A'  // FAA mode (A = Autonomous)
+    ]
+
+    const sentence = toSentence(sentenceParts)
+    return [sentence]
+  } catch (e) {
+    plugin.debug('[APB] Error building sentence:', e.message)
+    return null
   }
 }
